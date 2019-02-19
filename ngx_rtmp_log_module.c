@@ -204,7 +204,7 @@ ngx_rtmp_log_var_msec_getdata(ngx_rtmp_session_t *s, u_char *buf,
     ngx_time_t  *tp;
 
     tp = ngx_timeofday();
-    
+
     return ngx_sprintf(buf, "%T.%03M", tp->sec, tp->msec);
 }
 
@@ -325,6 +325,19 @@ ngx_rtmp_log_var_time_local_getdata(ngx_rtmp_session_t *s, u_char *buf,
 {
     return ngx_cpymem(buf, ngx_cached_http_log_time.data,
                       ngx_cached_http_log_time.len);
+}
+
+static size_t
+ngx_http_log_iso8601_getlen(ngx_rtmp_session_t *s, ngx_rtmp_log_op_t *op)
+{
+  return ngx_cached_http_log_iso8601.len;
+}
+
+static u_char *
+ngx_http_log_iso8601(ngx_rtmp_session_t *r, u_char *buf, ngx_rtmp_log_op_t *op)
+{
+    return ngx_cpymem(buf, ngx_cached_http_log_iso8601.data,
+                      ngx_cached_http_log_iso8601.len);
 }
 
 
@@ -449,6 +462,11 @@ static ngx_rtmp_log_var_t ngx_rtmp_log_vars[] = {
     { ngx_string("time_local"),
       ngx_rtmp_log_var_time_local_getlen,
       ngx_rtmp_log_var_time_local_getdata,
+      0 },
+
+    { ngx_string("time_iso8601"),
+      ngx_http_log_iso8601_getlen,
+      ngx_http_log_iso8601,
       0 },
 
     { ngx_string("msec"),
