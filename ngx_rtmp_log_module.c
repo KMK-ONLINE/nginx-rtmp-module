@@ -1,4 +1,3 @@
-
 /*
  * Copyright (C) Roman Arutyunyan
  */
@@ -61,6 +60,7 @@ typedef struct {
     ngx_open_file_t            *file;
     time_t                      disk_full_time;
     time_t                      error_log_time;
+    ngx_syslog_peer_t           *syslog_peer;
     ngx_rtmp_log_fmt_t *format;
 } ngx_rtmp_log_t;
 
@@ -330,7 +330,7 @@ ngx_rtmp_log_var_time_local_getdata(ngx_rtmp_session_t *s, u_char *buf,
 static size_t
 ngx_http_log_iso8601_getlen(ngx_rtmp_session_t *s, ngx_rtmp_log_op_t *op)
 {
-  return ngx_cached_http_log_iso8601.len;
+    return ngx_cached_http_log_iso8601.len;
 }
 
 static u_char *
@@ -488,6 +488,7 @@ static ngx_rtmp_log_var_t ngx_rtmp_log_vars[] = {
 };
 
 
+
 static void *
 ngx_rtmp_log_create_main_conf(ngx_conf_t *cf)
 {
@@ -592,6 +593,7 @@ ngx_rtmp_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_rtmp_log_main_conf_t   *lmcf;
     ngx_rtmp_log_fmt_t         *fmt;
     ngx_rtmp_log_t             *log;
+    ngx_syslog_peer_t          *peer;
     ngx_str_t                  *value, name;
     ngx_uint_t                  n;
 
@@ -609,19 +611,35 @@ ngx_rtmp_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
     }
 
+    lmcf = ngx_rtmp_conf_get_module_main_conf(cf, ngx_rtmp_log_module);
+
     log = ngx_array_push(lacf->logs);
     if (log == NULL) {
         return NGX_CONF_ERROR;
     }
 
     ngx_memzero(log, sizeof(*log));
+    if (ngx_strncmp(value[1].data, "syslog:", 7) == 0) {
 
-    lmcf = ngx_rtmp_conf_get_module_main_conf(cf, ngx_rtmp_log_module);
+        peer = ngx_pcalloc(cf->pool, sizeof(ngx_syslog_peer_t));
+        if (peer == NULL) {
+            return NGX_CONF_ERROR;
+        }
 
-    log->file = ngx_conf_open_file(cf->cycle, &value[1]);
-    if (log->file == NULL) {
-        return NGX_CONF_ERROR;
+        if (ngx_syslog_process_conf(cf, peer) != NGX_CONF_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        log->syslog_peer = peer;
+
+        //goto process_formats;
+    } else {
+        log->file = ngx_conf_open_file(cf->cycle, &value[1]);
+        if (log->file == NULL) {
+            return NGX_CONF_ERROR;
+        }
     }
+
 
     if (cf->args->nelts == 2) {
         ngx_str_set(&name, "combined");
@@ -935,9 +953,8 @@ ngx_rtmp_log_write(ngx_rtmp_session_t *s, ngx_rtmp_log_t *log, u_char *buf,
     }
 }
 
-
 static ngx_int_t
-ngx_rtmp_log_disconnect(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
+ngx_rtmp_log_handler(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
                         ngx_chain_t *in)
 {
     ngx_rtmp_log_app_conf_t    *lacf;
@@ -945,7 +962,9 @@ ngx_rtmp_log_disconnect(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
     ngx_rtmp_log_op_t          *op;
     ngx_uint_t                  n, i;
     u_char                     *line, *p;
-    size_t                      len;
+    size_t                      len, size;
+      // size;
+    ssize_t                     nsig;
 
     if (s->auto_pushed || s->relay) {
         return NGX_OK;
@@ -971,11 +990,58 @@ ngx_rtmp_log_disconnect(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
             len += op->getlen(s, op);
         }
 
+        if (log[i].syslog_peer) {
+            /* length of syslog's PRI and HEADER message parts */
+            len += sizeof("<255>Jan 01 00:00:00 ") - 1
+                   + ngx_cycle->hostname.len + 1
+                   + log[i].syslog_peer->tag.len + 2;
+
+            //goto alloc_line;
+            //line = ngx_pnalloc(s->pool, len);
+            line = ngx_pnalloc(s->connection->pool, len);
+            if (line == NULL) {
+                return NGX_ERROR;
+            }
+
+            p = line;
+
+            if (log[i].syslog_peer) {
+                p = ngx_syslog_add_header(log[i].syslog_peer, line);
+            }
+
+            op = log->format->ops->elts;
+            for (n = 0; n < log[i].format->ops->nelts; n++, ++op) {
+                //p = op[i].run(s, p, &op[i]);
+                p = op->getdata(s, p, op);
+            }
+
+            if (log[i].syslog_peer) {
+
+                size = p - line;
+
+                nsig = ngx_syslog_send(log[i].syslog_peer, line, size);
+
+                if (nsig < 0) {
+                    ngx_log_error(NGX_LOG_WARN, s->connection->log, 0,
+                                  "send() to syslog failed");
+
+                } else if ((size_t) n != size) {
+                    ngx_log_error(NGX_LOG_WARN, s->connection->log, 0,
+                                  "send() to syslog has written only %z of %uz",
+                                  n, size);
+                }
+
+                continue;
+            }
+
+        }
+
+
         len += NGX_LINEFEED_SIZE;
 
         line = ngx_palloc(s->connection->pool, len);
         if (line == NULL) {
-            return NGX_OK;
+            return NGX_ERROR;
         }
 
         p = line;
@@ -1027,7 +1093,7 @@ ngx_rtmp_log_postconfiguration(ngx_conf_t *cf)
     cmcf = ngx_rtmp_conf_get_module_main_conf(cf, ngx_rtmp_core_module);
 
     h = ngx_array_push(&cmcf->events[NGX_RTMP_DISCONNECT]);
-    *h = ngx_rtmp_log_disconnect;
+    *h = ngx_rtmp_log_handler;
 
     next_publish = ngx_rtmp_publish;
     ngx_rtmp_publish = ngx_rtmp_log_publish;
